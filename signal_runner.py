@@ -2,11 +2,13 @@ import argparse
 from datetime import datetime, timezone
 import os
 import time
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
 
 COINDCX_FUTURES_CANDLES_URL = "https://public.coindcx.com/market_data/candlesticks"
+IST = ZoneInfo("Asia/Kolkata")
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
@@ -24,6 +26,7 @@ DEFAULTS = {
     "body_required": 0.55,
     "use_sr_breakout": True,
     "use_range_breakout": True,
+    "use_trend_breakout": True,
     "entry_ref_mode": "Signal Close",
     "sl_buffer_ticks": 5,
     "tick_size": 0.1,
@@ -45,6 +48,19 @@ INTERVAL_MAP = {
     "8h": ("480", 28800),
     "1d": ("1D", 86400),
 }
+
+
+def format_symbol(pair: str) -> str:
+    """Convert CoinDCX pair like 'B-ZEC_USDT' into 'ZECUSDT'."""
+    cleaned = pair.strip().upper()
+    if cleaned.startswith("B-"):
+        cleaned = cleaned[2:]
+    return cleaned.replace("_", "")
+
+
+def format_ist_time(ts_ms: int) -> str:
+    dt_ist = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(IST)
+    return dt_ist.strftime("%Y-%m-%d %H:%M IST")
 
 
 def resolve_interval(interval: str):
@@ -92,6 +108,7 @@ def fetch_futures_closed_candles(pair: str, interval: str, bars: int = 300) -> p
 
     df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
+    # Drop the still-forming current candle so only closed candles are evaluated
     if len(df) > 1:
         df = df.iloc[:-1].reset_index(drop=True)
     return df
@@ -114,6 +131,19 @@ def compute_pivots(high: np.ndarray, low: np.ndarray, length: int):
     return ph, pl
 
 
+def project_trendline(x1: int, y1: float, x2: int, y2: float, x_target: int) -> float:
+    if (
+        np.isnan(y1)
+        or np.isnan(y2)
+        or x1 is None
+        or x2 is None
+        or x2 <= x1
+    ):
+        return np.nan
+    slope = (y2 - y1) / (x2 - x1)
+    return float(y1 + slope * (x_target - x1))
+
+
 def analyze_signals(df: pd.DataFrame, cfg: dict):
     pivot_len = cfg["pivot_len"]
     range_len = cfg["range_len"]
@@ -121,6 +151,7 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
     body_required = cfg["body_required"]
     use_sr = cfg["use_sr_breakout"]
     use_rng = cfg["use_range_breakout"]
+    use_trd = cfg["use_trend_breakout"]
     entry_mode = cfg["entry_ref_mode"]
     tick_size = cfg["tick_size"]
     buffer_amt = cfg["sl_buffer_ticks"] * tick_size
@@ -134,7 +165,15 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
     ph, pl = compute_pivots(highs, lows, pivot_len)
 
     last_high = np.nan
+    previous_high = np.nan
+    high_bar = None
+    previous_high_bar = None
+
     last_low = np.nan
+    previous_low = np.nan
+    low_bar = None
+    previous_low_bar = None
+
     range_active = False
     acc_high = np.nan
     acc_low = np.nan
@@ -145,9 +184,15 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
         pivot_idx = i - pivot_len
         if pivot_idx >= 0:
             if not np.isnan(ph[pivot_idx]):
+                previous_high = last_high
+                previous_high_bar = high_bar
                 last_high = ph[pivot_idx]
+                high_bar = pivot_idx
             if not np.isnan(pl[pivot_idx]):
+                previous_low = last_low
+                previous_low_bar = low_bar
                 last_low = pl[pivot_idx]
+                low_bar = pivot_idx
 
         if i >= range_len:
             r_high = np.max(highs[i - range_len : i])
@@ -179,6 +224,26 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
             acc_high = r_high
             acc_low = r_low
 
+        trend_high_curr = project_trendline(previous_high_bar, previous_high, high_bar, last_high, i)
+        trend_high_prev = project_trendline(previous_high_bar, previous_high, high_bar, last_high, i - 1)
+        trend_low_curr = project_trendline(previous_low_bar, previous_low, low_bar, last_low, i)
+        trend_low_prev = project_trendline(previous_low_bar, previous_low, low_bar, last_low, i - 1)
+
+        bull_trd = (
+            use_trd
+            and not np.isnan(trend_high_curr)
+            and not np.isnan(trend_high_prev)
+            and (closes[i] > trend_high_curr)
+            and (closes[i - 1] <= trend_high_prev)
+        )
+        bear_trd = (
+            use_trd
+            and not np.isnan(trend_low_curr)
+            and not np.isnan(trend_low_prev)
+            and (closes[i] < trend_low_curr)
+            and (closes[i - 1] >= trend_low_prev)
+        )
+
         candle_range = highs[i] - lows[i]
         body_ratio = (abs(closes[i] - opens[i]) / candle_range) if candle_range > 0 else 0.0
         strong_bull = (closes[i] > opens[i]) and (body_ratio >= body_required)
@@ -190,36 +255,64 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
         bull_rng = use_rng and range_break_up
         bear_rng = use_rng and range_break_down
 
-        buy_sig = strong_bull and (bull_sr or bull_rng)
-        sell_sig = strong_bear and (bear_sr or bear_rng)
+        long_sig = strong_bull and (bull_sr or bull_rng or bull_trd)
+        short_sig = strong_bear and (bear_sr or bear_rng or bear_trd)
 
-        if buy_sig or sell_sig:
-            if buy_sig:
-                side = "BUY"
+        if long_sig or short_sig:
+            if long_sig:
+                side = "LONG"
                 sl_price = lows[i] - buffer_amt
                 reasons = []
                 if bull_sr:
                     reasons.append("S/R Break")
                 if bull_rng:
                     reasons.append("Range Break")
-                candidates = [v for v, cond in [(last_high, bull_sr), (acc_high, bull_rng)] if cond and not np.isnan(v)]
+                if bull_trd:
+                    reasons.append("Trend Break")
+                candidates = [
+                    v
+                    for v, cond in [
+                        (last_high, bull_sr),
+                        (acc_high, bull_rng),
+                        (trend_high_curr, bull_trd),
+                    ]
+                    if cond and not np.isnan(v)
+                ]
                 broken_lvl = max(candidates) if candidates else np.nan
-                entry_price = broken_lvl if (entry_mode == "Broken Level" and not np.isnan(broken_lvl) and broken_lvl > sl_price) else closes[i]
+                entry_price = (
+                    broken_lvl
+                    if (entry_mode == "Broken Level" and not np.isnan(broken_lvl) and broken_lvl > sl_price)
+                    else closes[i]
+                )
                 risk_amt = max(entry_price - sl_price, tick_size)
                 tp1 = entry_price + risk_amt * cfg["tp1_rr"]
                 tp2 = entry_price + risk_amt * cfg["tp2_rr"]
                 tp3 = entry_price + risk_amt * cfg["tp3_rr"]
             else:
-                side = "SELL"
+                side = "SHORT"
                 sl_price = highs[i] + buffer_amt
                 reasons = []
                 if bear_sr:
                     reasons.append("S/R Break")
                 if bear_rng:
                     reasons.append("Range Break")
-                candidates = [v for v, cond in [(last_low, bear_sr), (acc_low, bear_rng)] if cond and not np.isnan(v)]
+                if bear_trd:
+                    reasons.append("Trend Break")
+                candidates = [
+                    v
+                    for v, cond in [
+                        (last_low, bear_sr),
+                        (acc_low, bear_rng),
+                        (trend_low_curr, bear_trd),
+                    ]
+                    if cond and not np.isnan(v)
+                ]
                 broken_lvl = min(candidates) if candidates else np.nan
-                entry_price = broken_lvl if (entry_mode == "Broken Level" and not np.isnan(broken_lvl) and broken_lvl < sl_price) else closes[i]
+                entry_price = (
+                    broken_lvl
+                    if (entry_mode == "Broken Level" and not np.isnan(broken_lvl) and broken_lvl < sl_price)
+                    else closes[i]
+                )
                 risk_amt = max(sl_price - entry_price, tick_size)
                 tp1 = entry_price - risk_amt * cfg["tp1_rr"]
                 tp2 = entry_price - risk_amt * cfg["tp2_rr"]
@@ -238,24 +331,28 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
                 "is_latest_closed_bar": (int(times[i]) == int(times[-1])),
             })
 
+    last_idx = len(df) - 1
     state = {
         "last_closed_time": int(times[-1]),
         "last_closed_close": float(closes[-1]),
         "resistance": None if np.isnan(last_high) else float(last_high),
         "support": None if np.isnan(last_low) else float(last_low),
+        "trend_high": project_trendline(previous_high_bar, previous_high, high_bar, last_high, last_idx),
+        "trend_low": project_trendline(previous_low_bar, previous_low, low_bar, last_low, last_idx),
         "range_active": bool(range_active),
     }
     return signals, state
 
 
 def format_signal(sig: dict, pair: str, interval: str, decimals: int = 2) -> str:
-    dt = datetime.fromtimestamp(sig["bar_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    symbol = format_symbol(pair)
+    dt_ist = format_ist_time(sig["bar_time"])
     tag = "FRESH FUTURES SIGNAL" if sig["is_latest_closed_bar"] else "LATEST HISTORICAL FUTURES SIGNAL"
     return (
         f"[{tag}]\n"
-        f"Side: {sig['side']} | {pair} ({interval})\n"
+        f"Symbol: {symbol} | Side: {sig['side']} | Timeframe: {interval}\n"
         f"Setup: {sig['reason']}\n"
-        f"Candle Time: {dt}\n"
+        f"Candle Time: {dt_ist}\n"
         f"Close: {sig['close']:.{decimals}f}\n"
         f"Limit: {sig['entry']:.{decimals}f}\n"
         f"SL: {sig['sl']:.{decimals}f}\n"
@@ -286,12 +383,16 @@ def get_signal(cfg: dict) -> dict | None:
 
     return {
         **selected,
+        "symbol": format_symbol(cfg["pair"]),
         "pair": cfg["pair"],
         "interval": cfg["interval"],
-        "last_closed_time": state["last_closed_time"],
+        "candle_time_ist": format_ist_time(selected["bar_time"]),
+        "last_closed_time_ist": format_ist_time(state["last_closed_time"]),
         "last_closed_close": state["last_closed_close"],
         "resistance": state["resistance"],
         "support": state["support"],
+        "trend_high": state["trend_high"],
+        "trend_low": state["trend_low"],
     }
 
 
@@ -310,11 +411,12 @@ def main():
     cfg["interval"] = args.interval
     cfg["tick_size"] = args.tick
 
+    symbol = format_symbol(cfg["pair"])
     df = fetch_futures_closed_candles(cfg["pair"], cfg["interval"], cfg["bars"])
     signals, state = analyze_signals(df, cfg)
 
-    closed_dt = datetime.fromtimestamp(state["last_closed_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"Futures Pair: {cfg['pair']} | Interval: {cfg['interval']} | Last Closed: {closed_dt}")
+    closed_ist = format_ist_time(state["last_closed_time"])
+    print(f"Symbol: {symbol} ({cfg['pair']}) | Interval: {cfg['interval']} | Last Closed: {closed_ist}")
     print(f"Last Close: {state['last_closed_close']:.{args.decimals}f} | Res: {state['resistance']} | Sup: {state['support']}")
 
     fresh = [s for s in signals if s["is_latest_closed_bar"]]
@@ -324,9 +426,9 @@ def main():
         print(msg)
         if args.send:
             send_telegram(msg)
-        return chosen
+        return {**chosen, "symbol": symbol, "last_closed_time_ist": closed_ist}
 
-    print("No fresh BUY/SELL futures signal on the latest closed candle.")
+    print("No fresh LONG/SHORT futures signal on the latest closed candle.")
     if signals:
         chosen = signals[-1]
         msg = format_signal(chosen, cfg["pair"], cfg["interval"], args.decimals)
@@ -334,7 +436,7 @@ def main():
             print(msg)
         if args.send:
             send_telegram(msg)
-        return chosen
+        return {**chosen, "symbol": symbol, "last_closed_time_ist": closed_ist}
 
     return None
 
