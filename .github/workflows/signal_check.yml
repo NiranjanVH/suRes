@@ -1,6 +1,8 @@
 name: Price Action Pro Signal Check
 
 on:
+  repository_dispatch:
+    types: [run_signal_check]
   workflow_dispatch:
     inputs:
       interval:
@@ -44,8 +46,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          INTERVAL_VAL="${{ github.event.client_payload.interval || inputs.interval || '5m' }}"
+          TICK_VAL="${{ github.event.client_payload.tick || inputs.tick || '0.1' }}"
+          DECIMALS_VAL="${{ github.event.client_payload.decimals || inputs.decimals || '2' }}"
+          SEND_VAL="${{ github.event.client_payload.send || inputs.send || 'true' }}"
+
           SEND_FLAG=""
-          if [ "${{ inputs.send }}" = "true" ] || [ "${{ inputs.send }}" = "1" ]; then
+          if [ "$SEND_VAL" = "true" ] || [ "$SEND_VAL" = "1" ]; then
             SEND_FLAG="--send"
           fi
 
@@ -53,9 +60,9 @@ jobs:
             echo "=== Running check for ${pair} ==="
             python signal_runner.py \
               --pair "${pair}" \
-              --interval "${{ inputs.interval }}" \
-              --tick "${{ inputs.tick }}" \
-              --decimals "${{ inputs.decimals }}" \
+              --interval "${INTERVAL_VAL}" \
+              --tick "${TICK_VAL}" \
+              --decimals "${DECIMALS_VAL}" \
               --show-history \
               $SEND_FLAG
           done
