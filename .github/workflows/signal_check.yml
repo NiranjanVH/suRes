@@ -2,6 +2,27 @@ name: Price Action Pro Signal Check
 
 on:
   workflow_dispatch:
+    inputs:
+      interval:
+        description: "Candle timeframe (e.g. 5m, 15m, 1h)"
+        required: false
+        default: "5m"
+        type: string
+      tick:
+        description: "Tick size"
+        required: false
+        default: "0.1"
+        type: string
+      decimals:
+        description: "Price decimal places"
+        required: false
+        default: "2"
+        type: string
+      send:
+        description: "Send alert to Telegram"
+        required: false
+        default: "true"
+        type: string
 
 jobs:
   check-signal:
@@ -18,8 +39,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run signal check
+      - name: Run signal check for ZECUSDT and XAUUSDT
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python signal_runner.py --pair B-ZEC_USDT --interval 5m --decimals 2 --send --show-history
+        run: |
+          SEND_FLAG=""
+          if [ "${{ inputs.send }}" = "true" ] || [ "${{ inputs.send }}" = "1" ]; then
+            SEND_FLAG="--send"
+          fi
+
+          for pair in "B-ZEC_USDT" "B-XAU_USDT"; do
+            echo "=== Running check for ${pair} ==="
+            python signal_runner.py \
+              --pair "${pair}" \
+              --interval "${{ inputs.interval }}" \
+              --tick "${{ inputs.tick }}" \
+              --decimals "${{ inputs.decimals }}" \
+              --show-history \
+              $SEND_FLAG
+          done
