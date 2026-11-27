@@ -15,8 +15,8 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8970361774")
 
 DEFAULTS = {
-    "pair": "B-ZEC_USDT",        # CoinDCX Futures instrument format (e.g., B-BTC_USDT, B-ETH_USDT, B-ZEC_USDT)
-    "interval": "5m",            # Accepts 1m, 5m, 15m, 30m, 1h, 4h, 1d (or raw resolution like 5, 15, 60, 1D)
+    "pair": "B-ZEC_USDT",
+    "interval": "5m",
     "bars": 300,
     "pivot_len": 5,
     "range_len": 12,
@@ -87,13 +87,11 @@ def fetch_futures_closed_candles(pair: str, interval: str, bars: int = 300) -> p
         if col in df.columns:
             df[col] = pd.to_numeric(df[col])
 
-    # Normalize timestamp to milliseconds if returned in seconds
     if df["time"].max() < 10_000_000_000:
         df["time"] = df["time"] * 1000
 
     df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-    # Drop the still-forming current candle so only closed candles are evaluated
     if len(df) > 1:
         df = df.iloc[:-1].reset_index(drop=True)
     return df
@@ -252,10 +250,10 @@ def analyze_signals(df: pd.DataFrame, cfg: dict):
 
 def format_signal(sig: dict, pair: str, interval: str, decimals: int = 2) -> str:
     dt = datetime.fromtimestamp(sig["bar_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    tag = "FRESH FUTURES SIGNAL" if sig["is_latest_closed_bar"] else "LAST HISTORICAL FUTURES SIGNAL"
+    tag = "FRESH FUTURES SIGNAL" if sig["is_latest_closed_bar"] else "LATEST HISTORICAL FUTURES SIGNAL"
     return (
         f"[{tag}]\n"
-        f"{sig['side']} FUTURES | {pair} ({interval})\n"
+        f"Side: {sig['side']} | {pair} ({interval})\n"
         f"Setup: {sig['reason']}\n"
         f"Candle Time: {dt}\n"
         f"Close: {sig['close']:.{decimals}f}\n"
@@ -273,6 +271,28 @@ def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
     resp.raise_for_status()
+
+
+def get_signal(cfg: dict) -> dict | None:
+    """Return the fresh signal on the latest closed candle, or else the latest historical signal."""
+    df = fetch_futures_closed_candles(cfg["pair"], cfg["interval"], cfg["bars"])
+    signals, state = analyze_signals(df, cfg)
+
+    fresh = [s for s in signals if s["is_latest_closed_bar"]]
+    selected = fresh[-1] if fresh else (signals[-1] if signals else None)
+
+    if selected is None:
+        return None
+
+    return {
+        **selected,
+        "pair": cfg["pair"],
+        "interval": cfg["interval"],
+        "last_closed_time": state["last_closed_time"],
+        "last_closed_close": state["last_closed_close"],
+        "resistance": state["resistance"],
+        "support": state["support"],
+    }
 
 
 def main():
@@ -299,15 +319,24 @@ def main():
 
     fresh = [s for s in signals if s["is_latest_closed_bar"]]
     if fresh:
-        for s in fresh:
-            msg = format_signal(s, cfg["pair"], cfg["interval"], args.decimals)
+        chosen = fresh[-1]
+        msg = format_signal(chosen, cfg["pair"], cfg["interval"], args.decimals)
+        print(msg)
+        if args.send:
+            send_telegram(msg)
+        return chosen
+
+    print("No fresh BUY/SELL futures signal on the latest closed candle.")
+    if signals:
+        chosen = signals[-1]
+        msg = format_signal(chosen, cfg["pair"], cfg["interval"], args.decimals)
+        if args.show_history:
             print(msg)
-            if args.send:
-                send_telegram(msg)
-    else:
-        print("No fresh BUY/SELL futures signal on the latest closed candle.")
-        if args.show_history and signals:
-            print(format_signal(signals[-1], cfg["pair"], cfg["interval"], args.decimals))
+        if args.send:
+            send_telegram(msg)
+        return chosen
+
+    return None
 
 
 if __name__ == "__main__":
