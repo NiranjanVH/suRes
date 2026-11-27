@@ -41,7 +41,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run signal check for ZECUSDT and XAUUSDT
+      - name: Run signal check for BTCUSDT, ZECUSDT, and XAUUSDT
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -56,7 +56,7 @@ jobs:
             SEND_FLAG="--send"
           fi
 
-          for pair in "B-ZEC_USDT" "B-XAU_USDT"; do
+          for pair in "B-BTC_USDT" "B-ZEC_USDT" "B-XAU_USDT"; do
             echo "=== Running check for ${pair} ==="
             python signal_runner.py \
               --pair "${pair}" \
