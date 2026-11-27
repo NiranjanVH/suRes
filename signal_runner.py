@@ -15,7 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "8970361774")
 
 DEFAULTS = {
-    "pair": "B-BTC_USDT",        # CoinDCX Futures instrument format (e.g., B-BTC_USDT, B-ETH_USDT, B-ZEC_USDT)
+    "pair": "B-ZEC_USDT",        # CoinDCX Futures instrument format (e.g., B-BTC_USDT, B-ETH_USDT, B-ZEC_USDT)
     "interval": "5m",            # Accepts 1m, 5m, 15m, 30m, 1h, 4h, 1d (or raw resolution like 5, 15, 60, 1D)
     "bars": 300,
     "pivot_len": 5,
